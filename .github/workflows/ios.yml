@@ -1,0 +1,31 @@
+name: Build iPhone IPA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - run: xcodegen generate
+      - name: Test recommendation and storage logic
+        run: |
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; print(next(v["udid"] for k,vs in reversed(list(json.load(sys.stdin)["devices"].items())) if "iOS" in k for v in vs if v["name"].startswith("iPhone")))')
+          xcodebuild test -project OfflineFeed.xcodeproj -scheme OfflineFeed -destination "platform=iOS Simulator,id=$SIM_ID" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - name: Archive for iPhone
+        run: |
+          xcodebuild -project OfflineFeed.xcodeproj -scheme OfflineFeed -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -archivePath build/OfflineFeed.xcarchive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= archive
+          mkdir -p build/ios/Payload
+          ditto build/OfflineFeed.xcarchive/Products/Applications/OfflineFeed.app build/ios/Payload/OfflineFeed.app
+          cd build/ios
+          zip -qry ../OfflineFeed-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OfflineFeed-unsigned
+          path: build/OfflineFeed-unsigned.ipa
+          if-no-files-found: error
