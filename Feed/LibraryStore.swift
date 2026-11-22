@@ -1,7 +1,6 @@
 import AVFoundation
 import CryptoKit
 import Foundation
-import Network
 import SwiftUI
 
 @MainActor final class LibraryStore: ObservableObject {
@@ -9,12 +8,6 @@ import SwiftUI
     @Published private(set) var preferences = Preferences()
     @Published var status = ""
     @Published var busy = false
-    @Published private(set) var refreshing = false
-    @Published private(set) var downloadStatus = ""
-    @Published private(set) var wifiAvailable = false
-    private var refreshTask: Task<Void, Never>?
-    private var downloadedRemoteIDs = Set<String>()
-    private let pathMonitor = NWPathMonitor()
     private let directory: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -38,15 +31,7 @@ import SwiftUI
             if FileManager.default.fileExists(atPath: prefs.path) {
                 preferences = try decoder.decode(Preferences.self, from: Data(contentsOf: prefs))
             }
-            let history = directory.appendingPathComponent("remote-history.json")
-            if let data = try? Data(contentsOf: history), let ids = try? decoder.decode(Set<String>.self, from: data) { downloadedRemoteIDs = ids }
-            downloadedRemoteIDs.formUnion(clips.compactMap(\.remoteID))
         } catch { writable = false; status = "Хранилище не удалось открыть. Не удаляй приложение: \(error.localizedDescription)" }
-        pathMonitor.pathUpdateHandler = { [weak self] path in
-            let connected = path.status == .satisfied && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet)) && !path.isExpensive && !path.isConstrained
-            Task { @MainActor in self?.wifiAvailable = connected }
-        }
-        pathMonitor.start(queue: DispatchQueue(label: "offline-feed-network"))
     }
 
     func url(for clip: Clip) -> URL { directory.appendingPathComponent(clip.filename) }
@@ -75,8 +60,9 @@ import SwiftUI
         } catch { status = "Не удалось прочитать профиль интересов" }
     }
 
-    func importVideos(_ urls: [URL], creator: String, source: String, tags: [String]) async {
+    func importVideos(_ urls: [URL], creator: String, source: String, tags: [String], confirmedRussian: Bool) async {
         guard !busy else { return }
+        guard confirmedRussian, ["instagram", "tiktok"].contains(FeedLogic.normalized(source)) else { status = "Выбери русскоязычные видео из Instagram или TikTok"; return }
         busy = true; defer { busy = false }
         var added = 0
         var skipped = 0
@@ -91,7 +77,7 @@ import SwiftUI
         status = "Добавлено: \(added) · Пропущено: \(skipped)" + (skipped > 0 ? " (повтор, неверный файл или лимит)" : "")
     }
 
-    private func add(_ input: URL, title: String, creator: String, source: String, tags: [String], remoteID: String? = nil, originURL: String? = nil, license: String? = nil) async throws {
+    private func add(_ input: URL, title: String, creator: String, source: String, tags: [String]) async throws {
         guard writable else { throw LibraryError.unavailable }
         let size = Int64(try input.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1)
         guard size > 0, FeedLogic.fits(existing: clips, incomingBytes: size) else { throw LibraryError.limit }
@@ -101,11 +87,17 @@ import SwiftUI
         let duration = try await asset.load(.duration).seconds
         let tracks = try await asset.loadTracks(withMediaType: .video)
         guard duration.isFinite, duration > 0, !tracks.isEmpty else { throw LibraryError.invalid }
-        if remoteID != nil {
-            guard (5...181).contains(duration), size <= Int64(duration * 345_000) else { throw LibraryError.invalid }
-        }
         let id = try await Task.detached(priority: .utility) { try Self.fileDigest(input) }.value
-        guard !clips.contains(where: { $0.id == id }) else { throw LibraryError.duplicate }
+        if let existing = clips.firstIndex(where: { $0.id == id }) {
+            if !FeedLogic.isRussianSocial(clips[existing]) {
+                let old = clips[existing]
+                clips[existing].source = source; clips[existing].creator = creator; clips[existing].tags = tags; clips[existing].language = "ru"
+                clips[existing].remoteID = nil; clips[existing].originURL = nil; clips[existing].license = nil
+                clips[existing].watched = false
+                do { try save(); return } catch { clips[existing] = old; throw error }
+            }
+            throw LibraryError.duplicate
+        }
         let filename = id + "." + ext
         let dest = directory.appendingPathComponent(filename)
         guard FeedLogic.fits(existing: clips, incomingBytes: size) else { throw LibraryError.limit }
@@ -113,93 +105,11 @@ import SwiftUI
         let actual = Int64(try dest.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1)
         guard actual == size else { try? FileManager.default.removeItem(at: dest); throw LibraryError.invalid }
         let old = clips
-        clips.append(Clip(id: id, filename: filename, title: title, creator: creator, source: source, tags: tags, bytes: actual, seconds: duration, remoteID: remoteID, originURL: originURL, license: license))
+        clips.append(Clip(id: id, filename: filename, title: title, creator: creator, source: source, tags: tags, bytes: actual, seconds: duration, language: "ru"))
         do { try save() } catch { clips = old; try? FileManager.default.removeItem(at: dest); throw error }
     }
 
-    func startRefresh(removeWatchedFirst: Bool) {
-        guard !busy, writable, FeedLogic.remaining(clips) < FeedLogic.target else {
-            if FeedLogic.remaining(clips) >= FeedLogic.target { downloadStatus = "Запас на 5 часов уже готов" }
-            return
-        }
-        guard wifiAvailable else { downloadStatus = "Подключись к обычному Wi-Fi для загрузки"; return }
-        if removeWatchedFirst { removeWatched() }
-        guard FeedLogic.used(clips) < FeedLogic.limit else { downloadStatus = "Лимит 6 ГБ уже заполнен"; return }
-        busy = true; refreshing = true
-        downloadStatus = "Ищем разрешённые ролики по твоим темам…"
-        refreshTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.runRefresh()
-        }
-    }
-
-    func stopRefresh() { refreshTask?.cancel(); downloadStatus = "Останавливаем загрузку…" }
-
-    private func remember(_ id: String) {
-        downloadedRemoteIDs.insert(id)
-        try? encoder.encode(downloadedRemoteIDs).write(to: directory.appendingPathComponent("remote-history.json"), options: .atomic)
-    }
-
-    private func runRefresh() async {
-        defer { busy = false; refreshing = false; refreshTask = nil }
-        let catalog = PeerTubeCatalog()
-        let topics = DownloadPolicy.searchTopics(preferences)
-        var added = 0, failed = 0, considered = 0, searched = 0, attempted = 0
-        var encountered = downloadedRemoteIDs
-        var related: [CatalogCandidate] = [], discovery: [CatalogCandidate] = []
-        // Two pages per topic, one at a time. Each download uses the publisher's official download endpoint.
-        let savedPage = max(0, UserDefaults.standard.integer(forKey: "peerTubeSearchPage")) % 10
-        for page in savedPage..<(savedPage + 2) {
-            for topic in topics {
-                if Task.isCancelled { downloadStatus = "Остановлено · сохранено \(added)"; return }
-                guard wifiAvailable else { downloadStatus = "Wi-Fi отключён. Попробуй ещё раз при подключении."; return }
-                attempted += 1
-                downloadStatus = "Поиск: \(attempted) из \(topics.count * 2)"
-                do {
-                    let matches = try await catalog.search(topic, page: page)
-                    for match in matches where !encountered.contains(match.id) {
-                        if topic.discovery { discovery.append(match) } else { related.append(match) }
-                    }
-                    searched += 1
-                } catch { failed += 1 }
-                try? await Task.sleep(nanoseconds: 150_000_000)
-            }
-        }
-        if searched > 0 { UserDefaults.standard.set((savedPage + 2) % 10, forKey: "peerTubeSearchPage") }
-        let candidates = DownloadPolicy.mix(related, discovery)
-        if candidates.isEmpty { downloadStatus = "Нет новых доступных роликов. Проверь Wi-Fi или повтори позже."; return }
-        for item in candidates {
-            if Task.isCancelled { break }
-            if !wifiAvailable { downloadStatus = "Wi-Fi отключён · сохранено \(added)"; return }
-            if FeedLogic.remaining(clips) >= FeedLogic.target { break }
-            let remaining = FeedLogic.limit - FeedLogic.used(clips)
-            if remaining < 100_000 { break }
-            // Check actual device capacity as well as the app's own budget.
-            let free = (try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? remaining
-            let allowed = min(remaining, max(0, free - 100_000_000))
-            if allowed < 100_000 { downloadStatus = "На iPhone недостаточно свободного места"; return }
-            guard encountered.insert(item.id).inserted else { continue }
-            considered += 1
-            downloadStatus = "Загружено \(added) · проверено \(considered)/\(candidates.count) · \(Int(FeedLogic.remaining(clips) / 60)) мин"
-            do {
-                let video = try await catalog.available(item, remaining: allowed)
-                let file = try await catalog.download(video, remaining: allowed)
-                defer { try? FileManager.default.removeItem(at: file) }
-                try Task.checkCancellation()
-                do {
-                    try await add(file, title: video.title, creator: video.creator, source: "PeerTube", tags: video.tags, remoteID: video.id, originURL: video.origin, license: video.license)
-                    remember(video.id)
-                    added += 1
-                } catch LibraryError.duplicate { remember(video.id) }
-            } catch { failed += 1 }
-            try? await Task.sleep(nanoseconds: 150_000_000)
-        }
-        let minutes = Int(FeedLogic.remaining(clips) / 60)
-        if Task.isCancelled { downloadStatus = "Остановлено · сохранено \(added) · запас \(minutes) мин" }
-        else if FeedLogic.remaining(clips) >= FeedLogic.target { downloadStatus = "Готово: запас на 5 часов · добавлено \(added)" }
-        else if FeedLogic.used(clips) >= FeedLogic.limit - 100_000 { downloadStatus = "Лимит памяти достигнут · запас \(minutes) мин" }
-        else { downloadStatus = "Добавлено \(added) · запас \(minutes) мин. Остальные доступные ролики закончились или не подошли (пропущено \(failed))." }
-    }
+    func removeOldPeerTube() { removeClips { FeedLogic.normalized($0.source) == "peertube" } }
 
     nonisolated private static func fileDigest(_ input: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: input)
@@ -227,14 +137,18 @@ import SwiftUI
     }
 
     func removeWatched() {
+        removeClips { $0.watched && !$0.liked }
+    }
+
+    private func removeClips(where predicate: (Clip) -> Bool) {
         guard writable, !busy else { return }
-        let removed = clips.filter { $0.watched && !$0.liked }
+        let removed = clips.filter(predicate)
         let old = clips
-        clips.removeAll { $0.watched && !$0.liked }
+        clips.removeAll(where: predicate)
         do {
             try save()
             for clip in removed { try? FileManager.default.removeItem(at: url(for: clip)) }
-            status = "Удалено просмотренных: \(removed.count)"
+            status = "Удалено роликов: \(removed.count)"
         } catch { clips = old; status = error.localizedDescription }
     }
 }

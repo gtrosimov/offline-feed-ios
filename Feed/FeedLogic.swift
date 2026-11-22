@@ -14,6 +14,7 @@ struct Clip: Codable, Identifiable, Equatable {
     var remoteID: String? = nil
     var originURL: String? = nil
     var license: String? = nil
+    var language: String? = nil
 }
 
 struct Preferences: Codable, Equatable {
@@ -40,6 +41,14 @@ enum FeedLogic {
     static func remaining(_ clips: [Clip]) -> Double {
         clips.filter { !$0.watched }.reduce(0) { $0 + max(0, $1.seconds) }
     }
+
+    static func isRussianSocial(_ clip: Clip) -> Bool {
+        ["instagram", "tiktok"].contains(normalized(clip.source)) && clip.language?.lowercased() == "ru"
+    }
+
+    static func socialRemaining(_ clips: [Clip]) -> Double { remaining(clips.filter(isRussianSocial)) }
+
+    static func socialQueue(_ clips: [Clip], _ prefs: Preferences) -> [Clip] { queue(clips.filter(isRussianSocial), prefs) }
 
     static func normalized(_ value: String) -> String {
         value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "@ \n\t"))
