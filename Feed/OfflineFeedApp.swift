@@ -20,6 +20,9 @@ struct FeedScreen: View {
     @State private var player = AVPlayer()
     @State private var playing = false
     @State private var finishedObserver: NSObjectProtocol?
+    @AppStorage("autoRefreshEnabled") private var autoRefresh = false
+    @AppStorage("autoRemoveWatched") private var autoRemoveWatched = true
+    @AppStorage("lastAutoRefreshAt") private var lastAutoRefreshAt = 0.0
 
     private var current: Clip? { queue.indices.contains(index) ? queue[index] : nil }
     private var liveClip: Clip? { current.flatMap { item in library.clips.first { $0.id == item.id } } }
@@ -40,6 +43,9 @@ struct FeedScreen: View {
                             Text(clip.creator.isEmpty ? "Моя подборка" : "@" + clip.creator).font(.headline).lineLimit(1)
                             Text(clip.title).font(.subheadline).lineLimit(2)
                             Text([clip.source, clip.tags.joined(separator: " · ")].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption).foregroundStyle(.white.opacity(0.65)).lineLimit(2)
+                            if let license = clip.license, let raw = clip.originURL, let url = DownloadPolicy.publicURL(raw) {
+                                Link(destination: url) { Text(license + " · источник").font(.caption2).foregroundStyle(.cyan).lineLimit(1) }
+                            }
                         }
                         Spacer()
                         VStack(spacing: 22) {
@@ -61,15 +67,19 @@ struct FeedScreen: View {
                     Spacer()
                     Image(systemName: "play.rectangle.on.rectangle").font(.system(size: 70, weight: .light)).foregroundStyle(.cyan)
                     Text(library.clips.isEmpty ? "Твоя лента ждёт" : "Подборка закончилась").font(.largeTitle.bold()).multilineTextAlignment(.center)
-                    Text(library.clips.isEmpty ? "Добавь скачанные видео, чтобы смотреть их без сети." : "Добавь новые ролики, чтобы продолжить просмотр.").font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 20)
-                    Button { settings = true } label: { Label("Добавить видео", systemImage: "plus.circle.fill").font(.headline).padding(16).frame(maxWidth: 300).background(.cyan, in: RoundedRectangle(cornerRadius: 16)).foregroundStyle(.black) }.buttonStyle(.plain)
+                    Text("Пополняй запас через Wi-Fi, затем смотри без интернета.").font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 20)
+                    Button { settings = true } label: { Label(library.refreshing ? "Загрузка идёт" : "Пополнить запас", systemImage: "arrow.down.circle.fill").font(.headline).padding(16).frame(maxWidth: 300).background(.cyan, in: RoundedRectangle(cornerRadius: 16)).foregroundStyle(.black) }.buttonStyle(.plain)
+                    if library.refreshing { ProgressView(); Text(library.downloadStatus).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center) }
                     Spacer()
                     Text("Всё на iPhone · интернет не нужен").font(.footnote).foregroundStyle(.secondary).padding(.bottom, 20)
                 }
             }
         }
-        .onAppear { reload() }
-        .onChange(of: scenePhase) { phase in if phase != .active { pause() } }
+        .onAppear { reload(); tryAutoRefresh() }
+        .onChange(of: scenePhase) { phase in if phase != .active { pause() } else { tryAutoRefresh() } }
+        .onChange(of: library.wifiAvailable) { available in if available && scenePhase == .active { tryAutoRefresh() } }
+        .onChange(of: library.busy) { busy in if !busy && current == nil && !settings { reload() } }
+        .onChange(of: library.clips.count) { _ in if current == nil && !settings { reload() } }
         .sheet(isPresented: $settings, onDismiss: { reload() }) { LibraryScreen().environmentObject(library) }
         .onChange(of: settings) { showing in if showing { pause() } }
         .onDisappear { pause(); detachObserver() }
@@ -98,6 +108,12 @@ struct FeedScreen: View {
     }
 
     private func reload() { queue = FeedLogic.queue(library.clips, library.preferences); index = 0; loadCurrent() }
+    private func tryAutoRefresh() {
+        let now = Date().timeIntervalSince1970
+        guard autoRefresh, library.wifiAvailable, !library.busy, FeedLogic.remaining(library.clips) < FeedLogic.target, now - lastAutoRefreshAt > 900 else { return }
+        lastAutoRefreshAt = now
+        library.startRefresh(removeWatchedFirst: autoRemoveWatched)
+    }
     private func advance(_ amount: Int) {
         if amount > 0, let clip = current { library.setWatched(clip.id) }
         index = max(0, min(queue.count, index + amount)); loadCurrent()
@@ -152,6 +168,8 @@ struct LibraryScreen: View {
     @State private var photos: [PhotosPickerItem] = []
     @State private var importingPhotos = false
     @State private var confirmRemove = false
+    @AppStorage("autoRefreshEnabled") private var autoRefresh = false
+    @AppStorage("autoRemoveWatched") private var autoRemoveWatched = true
     enum ImportMode: String, Identifiable { case video, profile; var id: String { rawValue } }
     private var occupied: Int64 { FeedLogic.used(library.clips) }
     private func parts(_ string: String) -> [String] { string.split(whereSeparator: { $0 == "," || $0 == "\n" }).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } }
@@ -165,6 +183,24 @@ struct LibraryScreen: View {
                         Text(timeText(FeedLogic.remaining(library.clips))).font(.system(size: 37, weight: .bold, design: .rounded))
                         ProgressView(value: min(1, Double(occupied) / Double(FeedLogic.limit))).tint(.cyan)
                         HStack { Text(String(format: "%.2f ГБ / 6 ГБ", Double(occupied) / 1e9)); Spacer(); Text("\(library.clips.count) видео") }.font(.caption).foregroundStyle(.secondary)
+                    }.panel()
+                    VStack(alignment: .leading, spacing: 13) {
+                        HStack { Text("Пополнение запаса").font(.title3.bold()); Spacer(); Image(systemName: "wifi").foregroundStyle(.cyan) }
+                        Text("Загрузка открытых коротких видео из PeerTube по твоим темам. Автор должен явно разрешить скачивание и указать свободную лицензию. Это отдельный источник, не оригинальная лента Instagram/TikTok.").font(.footnote).foregroundStyle(.secondary)
+                        ProgressView(value: min(1, FeedLogic.remaining(library.clips) / FeedLogic.target)).tint(.green)
+                        Text("Цель: 5 часов · до 6 ГБ · " + (library.wifiAvailable ? "Wi-Fi подключён" : "ожидание Wi-Fi")).font(.caption).foregroundStyle(.secondary)
+                        if library.refreshing {
+                            HStack { ProgressView(); Text(library.downloadStatus).font(.footnote); Spacer() }
+                            Button(role: .cancel) { library.stopRefresh() } label: { Label("Остановить", systemImage: "stop.circle").frame(maxWidth: .infinity) }.buttonStyle(.bordered)
+                        } else {
+                            Button { library.startRefresh(removeWatchedFirst: autoRemoveWatched) } label: {
+                                Label("Пополнить запас", systemImage: "arrow.down.circle.fill").frame(maxWidth: .infinity).padding(14).background(.cyan, in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.black).font(.headline)
+                            }.buttonStyle(.plain).disabled(library.busy || importingPhotos)
+                            if !library.downloadStatus.isEmpty { Text(library.downloadStatus).font(.caption).foregroundStyle(.secondary) }
+                        }
+                        Toggle("Пополнять при открытии по Wi-Fi", isOn: $autoRefresh).tint(.cyan)
+                        Toggle("Освобождать место от просмотренных", isOn: $autoRemoveWatched).tint(.cyan)
+                        Text("Любимые ролики не удаляются. Держи приложение открытым во время большой загрузки; iOS может остановить её в фоне. Поиск передаёт только общие темы, без аккаунтов и имён.").font(.caption2).foregroundStyle(.secondary)
                     }.panel()
                     VStack(alignment: .leading, spacing: 13) {
                         Text("Добавить ролики").font(.title3.bold())
@@ -189,7 +225,7 @@ struct LibraryScreen: View {
                         Button { importMode = .profile; showImporter = true } label: { Label("Импорт профиля интересов (.json)", systemImage: "person.crop.circle.badge.plus") }.font(.footnote)
                     }.panel()
                     Button(role: .destructive) { confirmRemove = true } label: { Label("Удалить просмотренные (кроме любимых)", systemImage: "trash") }.buttonStyle(.bordered).disabled(library.busy)
-                    Text("Лента использует только видео, которые уже находятся в приложении. Пароли и аккаунты не запрашиваются.").font(.footnote).foregroundStyle(.secondary)
+                    Text("Сохранённые ролики из библиотеки доступны офлайн. Пароли и аккаунты не запрашиваются.").font(.footnote).foregroundStyle(.secondary)
                 }.padding(16)
             }.navigationTitle("Библиотека").toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { dismiss() } } }
             .onAppear { fillPreferences() }

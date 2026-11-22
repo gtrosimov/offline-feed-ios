@@ -11,6 +11,9 @@ struct Clip: Codable, Identifiable, Equatable {
     let seconds: Double
     var watched: Bool = false
     var liked: Bool = false
+    var remoteID: String? = nil
+    var originURL: String? = nil
+    var license: String? = nil
 }
 
 struct Preferences: Codable, Equatable {
