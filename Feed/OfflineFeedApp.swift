@@ -5,9 +5,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 @main struct OfflineFeedApp: App {
-    @StateObject private var library = LibraryStore()
+    @StateObject private var library = ExternalVideoStore()
     var body: some Scene {
-        WindowGroup { FeedScreen().environmentObject(library).preferredColorScheme(.dark) }
+        WindowGroup { ExternalVideoHome().environmentObject(library).preferredColorScheme(.dark) }
     }
 }
 
